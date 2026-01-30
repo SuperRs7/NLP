@@ -1,9 +1,11 @@
+import math
 from typing import Tuple
 
 import torch
 from numpy import reshape
 from transformers import PretrainedConfig
 import torch.nn as nn
+import torch.nn.functional as F
 class ModelConfig(PretrainedConfig):
     model_type = "Tiny_K"
     def __init__(
@@ -165,6 +167,45 @@ class Attention(nn.Module):
         # 获取批次大小和序列长度,[batch_size, seq_len, dim]
         bsz, seqlen, _ = x.shape
 
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        # 调整形状以适应头的维度。
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        # 应用旋转位置嵌入
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+        # 对k/v 进行扩展
+        xk = repeat_kv(xk, self.n_rep)
+        xv = repeat_kv(xv, self.n_rep)
+
+        # 将头作为批次维度处理
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+
+        # 根据是否支持Flash Attention 选择实现方式
+        if self.flash:
+            # 使用Flash Attention
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+
+        else:
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            assert hasattr(self, 'mask')
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)
+
+
+        # 恢复时间维度合并头
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+
+        # 最终投影回残差流
+        output = self.wo(output)
+        output = self.resid_dropout(output)
+        return output
 
 
 
